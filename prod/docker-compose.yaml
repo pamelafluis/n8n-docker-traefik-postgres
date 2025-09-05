@@ -1,0 +1,148 @@
+
+services:
+
+  # -------------------------
+  # Postgres (self-managed)
+  # -------------------------
+  postgres:
+    image: postgres:16-alpine   # Postgres 16 (lightweight alpine)
+    container_name: n8n_postgres
+    restart: unless-stopped
+    # Named volume for persistent DB files
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${DB_POSTGRESDB_USER}
+      - POSTGRES_DB=${DB_POSTGRESDB_DATABASE}
+      - POSTGRES_PASSWORD=${DB_POSTGRESDB_PASSWORD} 
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_POSTGRESDB_USER} -d ${DB_POSTGRESDB_DATABASE} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - n8n-network
+    mem_limit: 2g
+    cpus: 1.0
+
+  # -------------------------
+  # n8n main (web UI + webhooks)
+  # -------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n_main
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    volumes:
+      # named volume for user-related files, credentials, workflows, logs, etc
+      - n8n_data:/home/node/.n8n
+    environment:
+      # Database (Postgres) - prefer file-based secret usage
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=${DB_POSTGRESDB_PORT}
+      - DB_POSTGRESDB_DATABASE=${DB_POSTGRESDB_DATABASE}
+      - DB_POSTGRESDB_USER=${DB_POSTGRESDB_USER}
+      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRESDB_PASSWORD}
+
+      # n8n app settings
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_REINSTALL_MISSING_PACKAGES=true
+      - N8N_RUNNERS_ENABLED=true
+      - WEBHOOK_URL=https://${N8N_HOSTNAME}             # actual public URL; override in .env
+      - GENERIC_TIMEZONE=${TZ}                         # e.g., "UTC" or "Asia/Kolkata"
+
+      # Basic auth for UI - use secret file variant
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+
+    networks:
+      - n8n-network
+      - traefik-public
+    ports:
+    #   # bind to container local port only — Traefik will route external traffic
+      - 127.0.0.1:5678:5678
+    labels:
+      - "traefik.enable=true"
+    # Tell Traefik which network to use to connect to this service
+      - "traefik.docker.network=n8nstack_traefik-public"
+
+    # --- HTTPS Router ---
+      - "traefik.http.routers.n8n.rule=Host(`${N8N_HOSTNAME}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+
+      # Traefik headers middleware for better security
+
+      - traefik.http.routers.n8n.tls=true
+      - traefik.http.middlewares.n8n.headers.SSLRedirect=true
+      - traefik.http.middlewares.n8n.headers.STSSeconds=315360000
+      - traefik.http.middlewares.n8n.headers.browserXSSFilter=true
+      - traefik.http.middlewares.n8n.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.n8n.headers.forceSTSHeader=true
+      - traefik.http.middlewares.n8n.headers.SSLHost=${N8N_HOSTNAME}
+      - traefik.http.middlewares.n8n.headers.STSIncludeSubdomains=true
+      - traefik.http.middlewares.n8n.headers.STSPreload=true
+      - traefik.http.routers.n8n.middlewares=n8n@docker
+
+    mem_limit: 4g
+    cpus: 2
+
+  # -------------------------
+  # Traefik (reverse proxy / TLS automation)
+  # -------------------------
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    command:
+    - --api.dashboard=true
+    - --api.insecure=false  # Secure the dashboard
+    - --providers.docker=true
+    - --providers.docker.exposedbydefault=false
+    - --providers.docker.network=n8nstack_traefik-public  # Specify network
+    - --entrypoints.web.address=:80
+    - --entrypoints.websecure.address=:443
+    # Let's Encrypt configuration
+    - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+    - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+    - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+    - --log.level=INFO  # Use INFO instead of DEBUG for production
+    ports:
+    - "80:80"
+    - "443:443"
+    - "8080:8080"
+    volumes:
+    #- traefik_data:/letsencrypt
+    - /home/ubuntu/traefik/acme.json:/letsencrypt/acme.json
+    - /home/ubuntu/traefik/log:/var/log/traefik
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+    - n8n-network
+    - traefik-public
+    
+    mem_limit: 512m
+    cpus: 0.5
+# -------------------------
+# Networks & Volumes
+# -------------------------
+networks:
+  n8n-network:
+    driver: bridge
+  traefik-public:
+    driver: bridge
+volumes:
+  pgdata:
+    name: n8n_pgdata
+  n8n_data:
+    name: n8n_data
+  # traefik_data:
+  #   name: traefik_data
