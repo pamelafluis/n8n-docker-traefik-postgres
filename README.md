@@ -1,3 +1,49 @@
+## Architecture
+
+This setup demonstrates how to run **n8n** securely inside an **OCI Compute VM** using Docker and **Traefik** as the reverse proxy.
+
+### 1\. Traffic Flow
+
+* A user accesses [`n8n.example.com`](http://n8n.example.com), which resolves via DNS to the VM’s **public IP**.
+    
+* Requests on **ports 80/443** reach the **Traefik container** inside the VM.
+    
+* Traefik forwards HTTPS traffic through the `traefik-public` network to the **n8n container**.
+    
+
+### 2\. Security & Certificates
+
+* Traefik manages SSL/TLS certificates automatically with **Let’s Encrypt CA**.
+    
+* Certificates are issued and renewed using the **ACME TLS challenge**.
+    
+* All certificates are stored securely in `./letsencrypt/acme.json`.
+    
+
+### 3\. Service Discovery
+
+* Traefik integrates with the **Docker Socket** to dynamically discover running containers.
+    
+* This eliminates manual configuration whenever services are added or updated.
+    
+
+### 4\. Application Layer
+
+* **n8n container** hosts the workflow automation platform.
+    
+* **Postgres container** provides persistent database storage, connected via the `n8n-network` (port 5432).
+    
+
+### 5\. Infrastructure
+
+* All components (Traefik, n8n, Postgres) run as **Docker containers** inside a single **OCI Compute VM**.
+    
+* Networking is logically separated using Docker networks (`traefik-public` and `n8n-network`).
+
+
+
+
+
 ```mermaid
 ---
 config:
