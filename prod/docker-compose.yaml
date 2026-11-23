@@ -1,5 +1,226 @@
 
 services:
+  # -------------------------
+  # ClickHouse — analytics store (INTERNAL ONLY)
+  # -------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: langfuse_clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - langfuse-internal
+    mem_limit: 4g
+    cpus: 1.5
+
+  # -------------------------
+  # Redis — queue (INTERNAL ONLY)
+  # -------------------------
+  langfuse-redis:
+    image: redis:7-alpine
+    container_name: langfuse_redis
+    restart: unless-stopped
+    command: >
+      --requirepass ${REDIS_AUTH}
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_AUTH}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - langfuse-internal
+    mem_limit: 768m
+    cpus: 0.5
+
+  # -------------------------
+  # MinIO — S3-compatible blob store (INTERNAL ONLY)
+  # -------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: langfuse_minio
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - langfuse-internal
+    mem_limit: 768m
+    cpus: 0.5
+
+  # -------------------------
+  # Langfuse worker — async ingestion (INTERNAL ONLY)
+  # -------------------------
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: langfuse_worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment: &langfuse-env
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@postgres:5432/langfuse
+      - SALT=${LANGFUSE_SALT}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
+      - TELEMETRY_ENABLED=true
+
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - REDIS_AUTH=${REDIS_AUTH}
+
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
+    networks:
+      - langfuse-internal
+      - n8n-network
+    mem_limit: 3g
+    cpus: 1
+
+  # -------------------------
+  # Langfuse web — UI + API (PUBLIC via Traefik)
+  # -------------------------
+  langfuse-web:
+    image: langfuse/langfuse:3
+    container_name: langfuse_web
+    restart: unless-stopped
+    depends_on:
+      - langfuse-worker
+    environment:
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@postgres:5432/langfuse
+      - SALT=${LANGFUSE_SALT}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
+      - TELEMETRY_ENABLED=true
+
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - REDIS_AUTH=${REDIS_AUTH}
+
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
+      - NEXTAUTH_URL=https://${LANGFUSE_HOSTNAME}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      - LANGFUSE_INIT_ORG_ID=default
+      - AUTH_DISABLE_SIGNUP=false
+    networks:
+      - langfuse-internal
+      - n8n-network
+      - traefik-public
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=n8nstack_traefik-public"
+      - "traefik.http.routers.langfuse.rule=Host(`${LANGFUSE_HOSTNAME}`)"
+      - "traefik.http.routers.langfuse.entrypoints=websecure"
+      - "traefik.http.routers.langfuse.tls=true"
+      - "traefik.http.routers.langfuse.tls.certresolver=letsencrypt"
+      - "traefik.http.services.langfuse.loadbalancer.server.port=3000"
+      - "traefik.http.middlewares.langfuse-sec.headers.STSSeconds=31536000"
+      - "traefik.http.middlewares.langfuse-sec.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.langfuse-sec.headers.browserXSSFilter=true"
+      - "traefik.http.routers.langfuse.middlewares=langfuse-sec@docker"
+    mem_limit: 3g
+    cpus: 1.5
+
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - ntfy_cache:/var/cache/ntfy
+      - ntfy_data:/var/lib/ntfy
+    networks:
+      - traefik-public
+      - n8n-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:80/v1/health | grep -q '\"healthy\":true' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=n8nstack_traefik-public"
+      - "traefik.http.routers.ntfy.rule=Host(`${NTFY_HOSTNAME}`)"
+      - "traefik.http.routers.ntfy.entrypoints=websecure"
+      - "traefik.http.routers.ntfy.tls=true"
+      - "traefik.http.routers.ntfy.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ntfy.loadbalancer.server.port=80"
+    mem_limit: 512m
+    cpus: 0.5
 
   # -------------------------
   # Postgres (self-managed)
@@ -34,6 +255,8 @@ services:
     image: n8nio/n8n:latest
     container_name: n8n_main
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
     volumes:
@@ -115,6 +338,7 @@ services:
     - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
     - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
     - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+    - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
     - --log.level=INFO  # Use INFO instead of DEBUG for production
     ports:
     - "80:80"
@@ -122,13 +346,13 @@ services:
     - "8080:8080"
     volumes:
     #- traefik_data:/letsencrypt
-    - /home/ubuntu/traefik/acme.json:/letsencrypt/acme.json
-    - /home/ubuntu/traefik/log:/var/log/traefik
+    - /home/ubuntu/n8n-docker-traefik-postgres/traefik/acme.json:/letsencrypt/acme.json
+    - /home/ubuntu/n8n-docker-traefik-postgres/traefik/log:/var/log/traefik
     - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
     - n8n-network
     - traefik-public
-    
+
     mem_limit: 512m
     cpus: 0.5
 # -------------------------
@@ -137,6 +361,8 @@ services:
 networks:
   n8n-network:
     driver: bridge
+  langfuse-internal:
+    driver: bridge
   traefik-public:
     driver: bridge
 volumes:
@@ -144,5 +370,15 @@ volumes:
     name: n8n_pgdata
   n8n_data:
     name: n8n_data
+  ntfy_cache:
+    name: ntfy_cache
+  ntfy_data:
+    name: ntfy_data
+  langfuse_clickhouse_data:
+    name: langfuse_clickhouse_data
+  langfuse_clickhouse_logs:
+    name: langfuse_clickhouse_logs
+  langfuse_minio_data:
+    name: langfuse_minio_data
   # traefik_data:
   #   name: traefik_data
